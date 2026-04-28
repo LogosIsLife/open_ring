@@ -173,7 +173,66 @@ def _outer_to_record(f, direction: str, utc_ms: int) -> Record | None:
             data={"status": status},
         )
 
-    # All other outer frames: silent (or could expose as _CONTROL_FRAME if needed)
+    # ----- Catch-up plane: history fetch (delta-sync cursor)
+    # Phone → Ring: 10 09 <subop:1> <cursor:3 LE> 00 ff ff ff ff ff
+    if op == 0x10 and direction == "phone" and len(f.raw) == 11:
+        cursor = f.raw[3] | (f.raw[4] << 8) | (f.raw[5] << 16)
+        return Record(
+            t=utc_ms, rt=None, ctr=None, sess=None,
+            tag="_HISTORY_FETCH_REQ", type="_HISTORY_FETCH_REQ",
+            data={"sub_op": f.raw[2], "cursor": cursor,
+                  "is_full_sync": cursor == 0},
+        )
+    # Ring → Phone: 11 09 <subop:1> <cursor:3 LE> ...
+    if op == 0x11 and direction == "ring" and len(f.raw) >= 6:
+        cursor = f.raw[3] | (f.raw[4] << 8) | (f.raw[5] << 16)
+        return Record(
+            t=utc_ms, rt=None, ctr=None, sess=None,
+            tag="_HISTORY_FETCH_RESP", type="_HISTORY_FETCH_RESP",
+            data={"sub_op": f.raw[2], "cursor": cursor},
+        )
+
+    # ----- Control plane: parameter RPC (0x2F sub-ops 0x20/0x21/0x22/0x26/0x28)
+    # Phone → Ring: 2F 02 20 <param:1>                 — read 4-byte param
+    if op == 0x2f and direction == "phone" and f.sub_op == 0x20 and len(f.raw) == 4:
+        return Record(
+            t=utc_ms, rt=None, ctr=None, sess=None,
+            tag="_PARAM_READ", type="_PARAM_READ",
+            data={"param_id": f.raw[3]},
+        )
+    # Ring → Phone: 2F 06 21 <param:1> <value:4>       — read response
+    if op == 0x2f and direction == "ring" and f.sub_op == 0x21 and len(f.raw) >= 8:
+        return Record(
+            t=utc_ms, rt=None, ctr=None, sess=None,
+            tag="_PARAM_READ_RESP", type="_PARAM_READ_RESP",
+            data={"param_id": f.raw[3], "value": list(f.raw[4:8])},
+        )
+    # Phone → Ring: 2F 03 22 <param:1> <byte_value:1>  — write byte 0
+    if op == 0x2f and direction == "phone" and f.sub_op == 0x22 and len(f.raw) == 5:
+        return Record(
+            t=utc_ms, rt=None, ctr=None, sess=None,
+            tag="_PARAM_WRITE_B0", type="_PARAM_WRITE_B0",
+            data={"param_id": f.raw[3], "byte_value": f.raw[4]},
+        )
+    # Phone → Ring: 2F 03 26 <param:1> <byte_value:1>  — write byte 2
+    if op == 0x2f and direction == "phone" and f.sub_op == 0x26 and len(f.raw) == 5:
+        return Record(
+            t=utc_ms, rt=None, ctr=None, sess=None,
+            tag="_PARAM_WRITE_B2", type="_PARAM_WRITE_B2",
+            data={"param_id": f.raw[3], "byte_value": f.raw[4]},
+        )
+    # Ring → Phone: 2F 0F 28 <param:1> <value:4> <ctr:2> 00 00 00 00 <slow:2> 7F
+    # 17-byte unsolicited push from ring announcing a parameter state change
+    if op == 0x2f and direction == "ring" and f.sub_op == 0x28 and len(f.raw) == 17:
+        return Record(
+            t=utc_ms, rt=None, ctr=None, sess=None,
+            tag="_PARAM_PUSH", type="_PARAM_PUSH",
+            data={"param_id": f.raw[3], "value": list(f.raw[4:8]),
+                  "counter": f.raw[8] | (f.raw[9] << 8),
+                  "slow_field": f.raw[14] | (f.raw[15] << 8)},
+        )
+
+    # All other outer frames: silent (subscribe acks, capability negotiation, etc.)
     return None
 
 

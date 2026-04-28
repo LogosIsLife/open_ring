@@ -23,6 +23,7 @@ from .framing import (
     looks_like_outer_frame,
 )
 from .replay import replay
+from .state import RingState, ClientState
 
 __all__ = [
     "Record",
@@ -35,6 +36,8 @@ __all__ = [
     "parse_inner_records",
     "looks_like_outer_frame",
     "replay",
+    "RingState",
+    "ClientState",
 ]
 
 __version__ = "0.1.0"

@@ -137,6 +137,7 @@ class OuraRingClient:
         await self._handshake()
         await self._time_sync_now()
         await self._subscribe_events()
+        await self._catchup()
 
     async def _disconnected_or_idle(self) -> None:
         # Detect disconnect via bleak's is_connected attribute
@@ -213,6 +214,71 @@ class OuraRingClient:
         # validate it — the formula is one-way (phone tells the ring the time;
         # the ring acknowledges).
 
+    # ----- control plane: parameter RPC + history fetch -----
+    #
+    # These let the driver actively change ring sensor configuration (toggle SpO2,
+    # set DHR mode, etc.) and request missed records from a delta-sync cursor.
+
+    # Documented parameter IDs (verified empirically; see truth-table § 8.2)
+    PARAM_DHR             = 0x02   # Daytime Heart Rate; bytes 0/2 are mode/sub-mode
+    PARAM_ACTIVITY_HR     = 0x03   # Activity HR enable; byte 0 toggle
+    PARAM_SPO2            = 0x04   # SpO2 enable; byte 0 toggle
+    PARAM_ACTIVITY_HR_AUX = 0x0B   # companion to 0x03 (read-only in observed traffic)
+    PARAM_UNMAPPED_0D     = 0x0D
+    PARAM_UNMAPPED_10     = 0x10
+
+    async def read_param(self, param_id: int) -> None:
+        """Fire `2F 02 20 <param>` to request the 4-byte param value. The ring
+        replies with `2F 06 21 <param> <value:4>` which `stream()` will surface
+        as a `_PARAM_READ_RESP` Record.
+        """
+        await self._write(bytes([0x2f, 0x02, 0x20, param_id]), response=False)
+
+    async def write_param_byte0(self, param_id: int, value: int) -> None:
+        """Fire `2F 03 22 <param> <value>` — sets BYTE 0 of the param."""
+        await self._write(bytes([0x2f, 0x03, 0x22, param_id, value & 0xff]), response=False)
+
+    async def write_param_byte2(self, param_id: int, value: int) -> None:
+        """Fire `2F 03 26 <param> <value>` — sets BYTE 2 of the param."""
+        await self._write(bytes([0x2f, 0x03, 0x26, param_id, value & 0xff]), response=False)
+
+    # High-level convenience wrappers
+
+    async def set_spo2(self, on: bool) -> None:
+        """Enable or disable SpO2 sampling. Verified by toggle-RE (spec § 8.3)."""
+        await self.write_param_byte0(self.PARAM_SPO2, 0x01 if on else 0x00)
+
+    async def set_activity_hr(self, on: bool) -> None:
+        """Toggle activity-heart-rate detection."""
+        await self.write_param_byte0(self.PARAM_ACTIVITY_HR, 0x01 if on else 0x00)
+
+    async def set_dhr_mode(self, mode: int, sub_mode: int = 0) -> None:
+        """Set Daytime Heart Rate mode (byte 0) and sub-mode (byte 2).
+        Observed: (mode=3, sub_mode=2) for an on-demand HR check; (mode=1, sub_mode=0) idle.
+        """
+        await self.write_param_byte0(self.PARAM_DHR, mode)
+        if sub_mode is not None:
+            await self.write_param_byte2(self.PARAM_DHR, sub_mode)
+
+    async def request_hr_on_demand(self) -> None:
+        """Fire the on-demand HR burst pattern: DHR mode=3 / sub-mode=2.
+        Per spec § 8.2: this triggers a ~20 s HR sampling window, after which
+        the ring returns to mode=1 / sub-mode=0 on its own.
+        """
+        await self.set_dhr_mode(mode=3, sub_mode=2)
+
+    async def request_history(self, sub_op: int = 0x00, cursor: int = 0) -> None:
+        """Phone → Ring: `10 09 <subop> <cursor:3 LE> 00 ff ff ff ff ff`.
+        cursor = 0 → full sync. Otherwise delta-sync from that point.
+        Sub-op selects which record-type cursor to query (different sub-ops are used
+        for different aggregations; observed sub-ops include 0x00, 0xff, plus ~250 others).
+        """
+        c = cursor.to_bytes(3, "little")
+        await self._write(
+            bytes([0x10, 0x09, sub_op]) + c + b"\x00\xff\xff\xff\xff\xff",
+            response=False,
+        )
+
     # ----- event subscribe -----
 
     async def _subscribe_events(self) -> None:
@@ -224,6 +290,22 @@ class OuraRingClient:
             await self._write(bytes([0x18, 0x03, category, 0xff]), response=False)
         # Send the post-handshake config push (verified byte-invariant)
         await self._write(bytes.fromhex("2f0b29043c19031e1800000000"), response=False)
+
+    async def _catchup(self) -> None:
+        """Autonomous catch-up: on every (re)connect, ask the ring for any
+        records it has buffered since the last delta-sync cursor we acknowledged.
+
+        We start with two probes that the app emits on every reconnect:
+            10 09 00 <0:3 LE> 00 ff ff ff ff ff   — sub-op 0x00 cursor=0
+            10 09 ff <0:3 LE> 00 ff ff ff ff ff   — sub-op 0xff cursor=0
+        Sub-op 0x00 is the legacy "general" cursor; 0xff is the "all types"
+        cursor used after the first connection. Cursor=0 = full re-sync.
+
+        For finer-grained catch-up after the initial handshake, the driver can
+        invoke `request_history(sub_op, cursor)` directly with a saved cursor.
+        """
+        await self.request_history(sub_op=0x00, cursor=0)
+        await self.request_history(sub_op=0xff, cursor=0)
 
     # ----- stream -----
 
