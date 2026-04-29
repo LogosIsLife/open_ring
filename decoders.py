@@ -69,27 +69,33 @@ def decode_debug_event_ind(p: bytes) -> dict[str, Any]:
 
 
 def decode_temp_event(p: bytes) -> dict[str, Any]:
-    """0x46 — even-size payload [4..14]; int16 LE values.
-        offsets 0,2: UNSIGNED (raw, unit unknown — likely ADC counts)
-        offsets 4,6,8,10,12: SIGNED, /100.0 → °C
-        Missing channels NaN-filled.
+    """0x46 — even-size payload [4..14]; int16_LE / 100.0 → °C for ALL channels.
+
+    Disasm note: the lib uses `ldrh` (unsigned) for offsets 0,2 and `ldrsh`
+    (signed) for offsets 4..12. In practice temp1/2 never go negative, so the
+    value range is identical to signed/100. Verified row-for-row against the
+    on-device DB: all three observable channels match within rounding.
+
+    Missing channels: signed-int16(-32768)/100 = -327.68 is the sentinel; we
+    emit `null`.
     """
     n = len(p)
     if n < 4 or n > 14 or n % 2 != 0:
         raise ValueError(f"TempEvent payload size must be even in [4..14], got {n}")
 
-    # Missing channels emit null (per envelope contract).
-    temp1 = _u16(p, 0)
-    temp2 = _u16(p, 2)
-    temp3 = _i16(p, 4) / 100.0 if n >= 6 else None
-    temp4 = _i16(p, 6) / 100.0 if n >= 8 else None
-    temp5 = _i16(p, 8) / 100.0 if n >= 10 else None
-    temp6 = _i16(p, 10) / 100.0 if n >= 12 else None
-    temp7 = _i16(p, 12) / 100.0 if n >= 14 else None
+    def _temp(off: int, signed: bool):
+        if off + 2 > n: return None
+        v = (_i16(p, off) if signed else _u16(p, off)) / 100.0
+        return None if v == -327.68 else v
+
     return {
-        "temp1_raw": temp1, "temp2_raw": temp2,
-        "temp3_c": temp3, "temp4_c": temp4, "temp5_c": temp5,
-        "temp6_c": temp6, "temp7_c": temp7,
+        "temp1_c": _temp(0,  False),
+        "temp2_c": _temp(2,  False),
+        "temp3_c": _temp(4,  True),
+        "temp4_c": _temp(6,  True),
+        "temp5_c": _temp(8,  True),
+        "temp6_c": _temp(10, True),
+        "temp7_c": _temp(12, True),
     }
 
 
