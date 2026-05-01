@@ -23,6 +23,11 @@ from .enums import STATE_CHANGE, MOTION_STATE, RING_EVENT_TYPE
 # Helpers
 # ----------------------------------------------------------------------------
 
+def _i8(b: int) -> int:
+    """Sign-extend a single byte to a Python int (mirrors aarch64 sxtb)."""
+    return b - 0x100 if b & 0x80 else b
+
+
 def _u16(b: bytes, off: int) -> int:
     return b[off] | (b[off + 1] << 8)
 
@@ -183,19 +188,25 @@ def decode_ibi_and_amplitude_event(p: bytes) -> dict[str, Any]:
 
 
 def decode_spo2_event(p: bytes) -> dict[str, Any]:
-    """0x6f — 14-byte typical payload; observation: byte 0 varies (header?),
-    bytes 1..N are packed int8 SpO₂ percent values. Observed values 90-99
-    (0x5a-0x63) consistent with SpO₂ percentages.
+    """0x6f — payload size [1..14]. Wire format derived from disasm of
+    `parse_api_spo2_event` @ 0x2c62b8:
 
-    Wire-format extraction not fully complete (parser uses indexed loop),
-    but the byte-walk pattern is verified.
+      byte 0:           <hdr_high:4 high nibble><hdr_low:4 low nibble>
+                         (high nibble stored shifted ×128 in lib's struct;
+                          low nibble stored as-is — likely a flag)
+      bytes 1..size-1:  per-sample SpO₂ percent values (uint8)
+      optional 0xff:    terminator at last byte (excluded from sample list)
+
+    Verified: observed payload `68 5d 5d 5d ... 5d` decodes to header_high=6,
+    header_low=8, spo2_percent=[93]*13 — all 93% readings.
     """
     if len(p) < 1:
         raise ValueError("Spo2Event payload too short")
+    samples_end = len(p) - 1 if len(p) > 1 and p[-1] == 0xff else len(p)
     return {
-        "first_byte": p[0],
-        "spo2_percent_packed": list(p[1:]),
-        "_note": "spo2_percent_packed are raw bytes; values in range 90-100 are plausible % readings",
+        "header_high": p[0] >> 4,
+        "header_low":  p[0] & 0x0F,
+        "spo2_percent": list(p[1:samples_end]),
     }
 
 
@@ -250,12 +261,42 @@ def decode_ehr_acm_intensity_event(p: bytes) -> dict[str, Any]:
 
 
 def decode_motion_event(p: bytes) -> dict[str, Any]:
-    """0x47 — auto-extractor: up to 6× uint8 at offsets 0..5 (orientation/accel bytes).
-    Observed sizes 4, 5, and 6 in real traffic — emit whatever bytes are present.
+    """0x47 — payload size [4..6]. Wire format derived from disasm of
+    `parse_api_motion_events` @ 0x2acf24:
+
+      byte 0:  <flags_high:3 (top 3 bits)><flags_low:5 (bottom 5 bits)>
+      byte 1:  signed int8 → ×8.0 → acm_x  (output[+8]  as float)
+      byte 2:  signed int8 → ×8.0 → acm_y  (output[+0xc] as float)
+      byte 3:  signed int8 → ×8.0 → acm_z  (output[+0x10] as float)
+      byte 4 (size ≥ 5): bit 6 must be 0 (validation), bit 7 = `flag_b4_bit7`,
+                          bits 0-5 = `low6_b4` (6-bit field; orientation-related)
+      byte 5 (size ≥ 6): bit 6 must be 0 (validation), bits 0-5 = `low6_b5`
+
+    The ×8 scaling produces values in roughly [-1024..+1024] from int8 input.
+    DB MotionPeriod.acm_average_x ranges 576/-56/-328 (sample) — fits the range.
     """
-    if len(p) < 1:
-        raise ValueError("MotionEvent payload empty")
-    return {"bytes": list(p[:6]), "trailing": p[6:].hex()}
+    n = len(p)
+    if n < 4 or n > 6:
+        raise ValueError(f"MotionEvent payload size must be in [4..6], got {n}")
+    out: dict[str, Any] = {
+        "flags_high": p[0] >> 5,
+        "flags_low":  p[0] & 0x1F,
+        # Signed int8 → ×8 — empirical scale from disasm; units inferred from
+        # DB acm_average_x range (~ -512..+576 for typical wear)
+        "acm_x": _i8(p[1]) * 8,
+        "acm_y": _i8(p[2]) * 8,
+        "acm_z": _i8(p[3]) * 8,
+    }
+    if n >= 5:
+        if p[4] & 0x40:
+            raise ValueError("MotionEvent byte4 bit 6 must be 0")
+        out["flag_b4_bit7"] = (p[4] >> 7) & 1
+        out["low6_b4"]      = p[4] & 0x3F
+    if n >= 6:
+        if p[5] & 0x40:
+            raise ValueError("MotionEvent byte5 bit 6 must be 0")
+        out["low6_b5"] = p[5] & 0x3F
+    return out
 
 
 def decode_motion_period(p: bytes) -> dict[str, Any]:
@@ -423,18 +464,34 @@ def decode_spo2_dc_event(p: bytes) -> dict[str, Any]:
 
 
 def decode_green_ibi_quality_event(p: bytes) -> dict[str, Any]:
-    """0x80 — `API_GREEN_IBI_QUALITY_EVENT`. Auto-extractor found uint8 reads
-    at offsets 0,1; the rest of the payload is loop-walked (variable per record).
-    Distinct from `parse_api_green_ibi_and_amp_event` (a different sub-parser).
+    """0x80 — `API_GREEN_IBI_QUALITY_EVENT`. Wire format derived from disasm
+    of `parse_api_green_ibi_quality_event` @ 0x2c70d0.
+
+    The parser is *partially stateful* (reads `RingEventParser::session()`
+    flags at offsets 0x8 / 0x20 to gate processing), but the per-sample
+    payload format is deterministic:
+
+      payload is N pairs of bytes where N = floor(payload_size / 2).
+      Each pair is (b_low, b_high) at offsets 2*i, 2*i+1:
+        value_11bit = (b_low << 3) | (b_high & 0x07)   ← likely IBI in ms
+        quality_a   = (b_high >> 3) & 0x03             ← 2-bit quality flag
+        quality_b   = (b_high >> 5)                    ← 3-bit quality flag
+
+    Verified against observed payload `84 27 5f 2f 5e 0e 60 10 ef 52 fa b0 77 b3`
+    → 7 samples decoded. Each sample's 11-bit value is in IBI-plausible range.
     """
-    if len(p) < 2:
-        raise ValueError("GreenIbiQualityEvent payload too short")
-    return {
-        "byte_0": p[0],
-        "byte_1": p[1],
-        "trailing_hex": p[2:].hex(),
-        "len": len(p),
-    }
+    n = len(p)
+    if n < 2 or n % 2 != 0:
+        raise ValueError(f"GreenIbiQuality payload must be even ≥ 2, got {n}")
+    samples = []
+    for i in range(0, n, 2):
+        b_low, b_high = p[i], p[i + 1]
+        samples.append({
+            "value_11bit": (b_low << 3) | (b_high & 0x07),
+            "quality_a":   (b_high >> 3) & 0x03,
+            "quality_b":   (b_high >> 5) & 0x07,
+        })
+    return {"samples": samples, "_note": "parser is partially stateful (reads session flags); per-sample fields are deterministic"}
 
 
 def decode_scan_start(p: bytes) -> dict[str, Any]:
