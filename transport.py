@@ -267,6 +267,16 @@ class OuraRingClient:
         """
         await self.set_dhr_mode(mode=3, sub_mode=2)
 
+    async def soft_reset(self) -> None:
+        """Issue a soft reset to the ring: phone sends `0e 01 ff`, ring acks
+        `0f 01 00`, and the ring reboots ~25-35 seconds later (emits
+        `API_RING_START_IND` on reconnect).
+
+        Verified across thursday.log: 3 reset commands → 3 ring boots, each
+        with ack latency 19-181 ms and reboot delay 22-35 s.
+        """
+        await self._write(b"\x0e\x01\xff", response=False)
+
     async def request_history(self, sub_op: int = 0x00, cursor: int = 0) -> None:
         """Phone → Ring: `10 09 <subop> <cursor:3 LE> 00 ff ff ff ff ff`.
         cursor = 0 → full sync. Otherwise delta-sync from that point.

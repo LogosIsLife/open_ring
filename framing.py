@@ -22,6 +22,7 @@ OPCODES: dict[int, str] = {
     0x06: "identity_req",       0x07: "identity_resp",
     0x08: "time_or_id_req",     0x09: "time_or_id_resp",
     0x0c: "battery_req",        0x0d: "battery_resp",
+    0x0e: "soft_reset_req",     0x0f: "soft_reset_ack",
     0x10: "history_fetch",      0x11: "history_fetch_resp",
     0x12: "time_sync_req",      0x13: "time_sync_resp",
     0x16: "subscribe",          0x17: "subscribe_ack",

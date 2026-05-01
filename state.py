@@ -118,6 +118,11 @@ class RingState:
     # ---- Latest unparsed debug string (handy for ad-hoc display)
     last_debug_text: str | None = None
 
+    # ---- Soft-reset telemetry
+    last_reset_req_at_ms: int | None = None      # phone sent `0e 01 ff`
+    last_reset_ack_at_ms: int | None = None      # ring acked `0f 01 00`
+    reset_count: int = 0                          # number of soft resets observed
+
     # ---- Control-plane state: known parameter values
     # 4-byte struct per param. We update from _PARAM_READ_RESP and _PARAM_PUSH.
     # Keys are documented param IDs (0x02 DHR, 0x03 ActivityHR, 0x04 SpO2, etc.).
@@ -141,6 +146,13 @@ class RingState:
         if rec.type == "_TIME_SYNC_REPLY":
             self.last_time_sync_ack_unix_ms = rec.t
             self.ring_time_counter_echo = rec.data.get("time_echo")
+            return
+        if rec.type == "_RING_RESET_REQ":
+            self.last_reset_req_at_ms = rec.t
+            self.reset_count += 1
+            return
+        if rec.type == "_RING_RESET_ACK":
+            self.last_reset_ack_at_ms = rec.t
             return
         if rec.type in ("_PARAM_READ_RESP", "_PARAM_PUSH"):
             pid = rec.data.get("param_id")

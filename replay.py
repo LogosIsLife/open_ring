@@ -173,6 +173,23 @@ def _outer_to_record(f, direction: str, utc_ms: int) -> Record | None:
             data={"status": status},
         )
 
+    # ----- Soft reset (verified by correlation: each request precedes a ring
+    # reboot by 22-35s, ring acks within 30-200 ms with status=0x00)
+    # Phone → Ring: 0e 01 ff
+    if op == 0x0e and direction == "phone" and len(f.raw) == 3 and f.raw[2] == 0xff:
+        return Record(
+            t=utc_ms, rt=None, ctr=None, sess=None,
+            tag="_RING_RESET_REQ", type="_RING_RESET_REQ",
+            data={"sub_op": f.raw[2]},
+        )
+    # Ring → Phone: 0f 01 <status>  (00 = reset accepted)
+    if op == 0x0f and direction == "ring" and len(f.raw) == 3:
+        return Record(
+            t=utc_ms, rt=None, ctr=None, sess=None,
+            tag="_RING_RESET_ACK", type="_RING_RESET_ACK",
+            data={"status": f.raw[2]},
+        )
+
     # ----- Catch-up plane: history fetch (delta-sync cursor)
     # Phone → Ring: 10 09 <subop:1> <cursor:3 LE> 00 ff ff ff ff ff
     if op == 0x10 and direction == "phone" and len(f.raw) == 11:
