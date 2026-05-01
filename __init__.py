@@ -24,6 +24,7 @@ from .framing import (
 )
 from .replay import replay
 from .state import RingState, ClientState
+from . import realm_dump
 
 __all__ = [
     "Record",

@@ -3,9 +3,10 @@
 Each decoder takes the raw payload bytes (the part after the 6-byte TLV header)
 and returns a dict suitable for the JSONL `data` field.
 
-All decoders are pure functions: payload → dict. Stateful types (RawPpgData,
-CvaRawPpgData) return raw hex; full decode requires session-state tracking
-beyond the scope of this driver.
+Most decoders are pure functions: payload → dict. The stateful raw-PPG decoder
+is exposed as `CvaPpgDecoder` (instance state), and the dispatcher's `decode()`
+remains stateless. Callers (replay/transport) own one `CvaPpgDecoder` per
+session and post-enrich 0x81 records.
 
 Decoders raise ValueError on malformed input; the dispatcher catches and
 emits a `_DECODE_ERROR` event.
@@ -44,6 +45,95 @@ def _u32(b: bytes, off: int) -> int:
 def _i32(b: bytes, off: int) -> int:
     v = _u32(b, off)
     return v - 0x100000000 if v & 0x80000000 else v
+
+
+# ----------------------------------------------------------------------------
+# Stateful: CvaRawPpgData (0x81) — see libringeventparser.so
+# `decode_ppg_event_bytes(EventPayload, RawPpgMeasurement, CvaPPG_State_v1)` at
+# 0x2c09d0. The state object (16 bytes used: mode_flag, sub_counter, accumulator,
+# last_value) is held in `RingEventParser::session()` at +0xc8 and reused across
+# 0x81 records within a single sampler session.
+#
+# Wire format (one byte at a time):
+#   - 0x80 byte           → marker: start of an absolute sample. Resets
+#                            accumulator and sub_counter; mode_flag = 1.
+#   - bytes after 0x80    → 3 bytes assembled little-endian into a u24, then
+#                            sign-extended to s32 (OR 0xff000000 if the high
+#                            byte's MSB is set) → emit one absolute sample.
+#   - any other byte b    → signed int8 delta added to last_value → emit one
+#                            sample.
+#
+# Cardinality: 99.4% of observed 0x81 wire records are 14 bytes. Within a burst
+# of records, samples accumulate; the 0x80 markers re-anchor when the signal
+# drifts beyond ±127 from the previous sample.
+# ----------------------------------------------------------------------------
+
+
+class CvaPpgDecoder:
+    """Stateful decoder for `0x81 API_CVA_RAW_PPG_DATA`.
+
+    Owners (replay/transport) instantiate one decoder per sampler session and
+    call `feed(payload)` for each 0x81 record's bytes. The returned list is
+    the samples emitted by THIS record (24-bit signed ADC counts). Internal
+    state persists across calls so deltas resolve against the prior absolute.
+
+    Reset on observed session boundary (new `sess`, ctr discontinuity, or an
+    explicit FeatureSession capability transition for cva_ppg_sampler).
+    """
+
+    __slots__ = ("mode_flag", "sub_counter", "accumulator", "last_value",
+                 "samples_total", "absolutes_total", "deltas_total",
+                 "records_fed", "bytes_fed")
+
+    def __init__(self) -> None:
+        self.reset()
+        self.samples_total = 0
+        self.absolutes_total = 0
+        self.deltas_total = 0
+        self.records_fed = 0
+        self.bytes_fed = 0
+
+    def reset(self) -> None:
+        self.mode_flag = 0     # 0 = expecting marker/delta, 1 = collecting absolute
+        self.sub_counter = 0   # 0..3 byte-index within current absolute
+        self.accumulator = 0   # u32 LE byte assembly
+        self.last_value = 0    # s32 last emitted sample
+
+    def feed(self, payload: bytes) -> list[int]:
+        out: list[int] = []
+        for b in payload:
+            if self.mode_flag:
+                # Collecting bytes 0..2 of absolute sample (LE)
+                if self.sub_counter <= 2:
+                    self.accumulator |= (b << (self.sub_counter * 8))
+                    self.sub_counter += 1
+                if self.sub_counter == 3:
+                    # Sign-extend if the third byte's high bit is set
+                    if b & 0x80:
+                        sample = self.accumulator | 0xff000000
+                        sample -= 0x100000000
+                    else:
+                        sample = self.accumulator
+                    self.last_value = sample
+                    out.append(sample)
+                    self.absolutes_total += 1
+                    self.mode_flag = 0
+            else:
+                if b == 0x80:
+                    # New absolute marker: reset accumulator + sub_counter
+                    self.accumulator = 0
+                    self.sub_counter = 0
+                    self.mode_flag = 1
+                else:
+                    # Signed-int8 delta against last_value
+                    delta = b - 0x100 if b & 0x80 else b
+                    self.last_value = self.last_value + delta
+                    out.append(self.last_value)
+                    self.deltas_total += 1
+        self.samples_total += len(out)
+        self.records_fed += 1
+        self.bytes_fed += len(payload)
+        return out
 
 
 # ----------------------------------------------------------------------------

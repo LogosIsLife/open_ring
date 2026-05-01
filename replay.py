@@ -11,7 +11,7 @@ import sys
 from collections.abc import Iterator
 from pathlib import Path
 
-from .decoders import canonical_type, decode
+from .decoders import CvaPpgDecoder, canonical_type, decode
 from .envelope import Record
 from .framing import (
     OPCODES,
@@ -69,6 +69,14 @@ def replay(
     # The lib emits utc_time_ms for each parsed event; offline we have the
     # btsnoop arrival timestamp which is the BLE controller's view (close enough
     # — typically <100 ms drift from the on-wire ring time-corrected timestamp).
+    # CvaRawPpg state lives in `RingEventParser::session()` at +0xc8. It survives
+    # BLE-session-id (`sess`) changes — the on-ring sampler keeps running while
+    # the BLE link reconnects. We therefore keep ONE decoder per replay; reset
+    # only on long time-gaps (>60 s, sampler was likely off) or after an
+    # observed `_RING_RESET_ACK` (firmware reboot wipes session state).
+    cva_ppg_dec = CvaPpgDecoder()
+    cva_ppg_last_t: int | None = None
+
     for ts_seconds, pkt in btsnoop_packets(path):
         parsed = parse_att(pkt)
         if not parsed:
@@ -89,12 +97,27 @@ def replay(
             for f in parse_outer_frames(value):
                 rec = _outer_to_record(f, direction, utc_ms)
                 if rec is not None:
+                    if rec.type == "_RING_RESET_ACK":
+                        cva_ppg_dec.reset()
                     yield rec
         else:
             # Inner record stream (always ring→phone in normal use)
             if direction != "ring":
                 continue
             for r in parse_inner_records(value):
+                data = decode(r.type_byte, r.payload)
+                if r.type_byte == 0x81:
+                    if cva_ppg_last_t is not None and (utc_ms - cva_ppg_last_t) > 60_000:
+                        cva_ppg_dec.reset()
+                    samples = cva_ppg_dec.feed(r.payload)
+                    data = {
+                        "samples": samples,
+                        "samples_in_record": len(samples),
+                        "session_samples_total": cva_ppg_dec.samples_total,
+                        "session_absolutes": cva_ppg_dec.absolutes_total,
+                        "session_deltas": cva_ppg_dec.deltas_total,
+                    }
+                    cva_ppg_last_t = utc_ms
                 yield Record(
                     t=utc_ms,
                     rt=None,                # ring_time isn't in the inner-record TLV
@@ -102,7 +125,7 @@ def replay(
                     sess=r.session,
                     tag=f"0x{r.type_byte:02x}",
                     type=canonical_type(r.type_byte),
-                    data=decode(r.type_byte, r.payload),
+                    data=data,
                 )
 
 

@@ -32,7 +32,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from .crypto import compute_handshake_proof, extract_auth_key_from_realm
-from .decoders import canonical_type, decode
+from .decoders import CvaPpgDecoder, canonical_type, decode
 from .envelope import Record
 from .framing import (
     OPCODES,
@@ -326,6 +326,8 @@ class OuraRingClient:
         (handshake, time-sync, battery, disconnect) are emitted between record
         streams.
         """
+        cva_ppg_dec = CvaPpgDecoder()
+        cva_ppg_last_t: int | None = None
         while True:
             try:
                 while True:
@@ -335,9 +337,24 @@ class OuraRingClient:
                     if looks_like_outer_frame(value):
                         for f in parse_outer_frames(value):
                             for rec in _outer_to_records(f, utc_ms):
+                                if rec.type == "_RING_RESET_ACK":
+                                    cva_ppg_dec.reset()
                                 yield rec
                     else:
                         for r in parse_inner_records(value):
+                            data = decode(r.type_byte, r.payload)
+                            if r.type_byte == 0x81:
+                                if cva_ppg_last_t is not None and (utc_ms - cva_ppg_last_t) > 60_000:
+                                    cva_ppg_dec.reset()
+                                samples = cva_ppg_dec.feed(r.payload)
+                                data = {
+                                    "samples": samples,
+                                    "samples_in_record": len(samples),
+                                    "session_samples_total": cva_ppg_dec.samples_total,
+                                    "session_absolutes": cva_ppg_dec.absolutes_total,
+                                    "session_deltas": cva_ppg_dec.deltas_total,
+                                }
+                                cva_ppg_last_t = utc_ms
                             yield Record(
                                 t=utc_ms,
                                 rt=None,
@@ -345,7 +362,7 @@ class OuraRingClient:
                                 sess=r.session,
                                 tag=f"0x{r.type_byte:02x}",
                                 type=canonical_type(r.type_byte),
-                                data=decode(r.type_byte, r.payload),
+                                data=data,
                             )
             except (asyncio.CancelledError, KeyboardInterrupt):
                 raise
