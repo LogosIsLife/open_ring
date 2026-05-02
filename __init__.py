@@ -22,6 +22,7 @@ from .framing import (
     parse_inner_records,
     looks_like_outer_frame,
 )
+from .persistence import CursorStore
 from .replay import replay
 from .state import RingState, ClientState
 from . import realm_dump
@@ -39,6 +40,7 @@ __all__ = [
     "replay",
     "RingState",
     "ClientState",
+    "CursorStore",
 ]
 
 __version__ = "0.1.0"

@@ -402,10 +402,23 @@ class ClientState:
             self.history_fetch_count += 1
             if rec.data.get("is_full_sync"):
                 self.history_fetch_full_sync_count += 1
-            self.last_history_cursor_by_subop[rec.data["sub_op"]] = rec.data["cursor"]
+            sub_op = rec.data["sub_op"]
+            cur = rec.data["cursor"]
+            # Only advance forward — a regression here means a full re-sync
+            # request, not an actual position move. Persist via CursorStore;
+            # see oura_ring.persistence for the file-backed accessor.
+            if cur > self.last_history_cursor_by_subop.get(sub_op, 0):
+                self.last_history_cursor_by_subop[sub_op] = cur
             return
         if rec.type == "_HISTORY_FETCH_RESP":
-            return  # already accounted for via the request
+            sub_op = rec.data.get("sub_op")
+            cur = rec.data.get("cursor")
+            if sub_op is not None and cur is not None:
+                # The ring's reported end-of-buffer position — the value we
+                # should save and use as `cursor` on the next request.
+                if cur > self.last_history_cursor_by_subop.get(sub_op, 0):
+                    self.last_history_cursor_by_subop[sub_op] = cur
+            return
 
         # ---- Control plane ----
         if rec.type in ("_PARAM_READ", "_PARAM_WRITE_B0", "_PARAM_WRITE_B2", "_PARAM_PUSH",

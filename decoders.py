@@ -530,13 +530,23 @@ def decode_ehr_trace_event(p: bytes) -> dict[str, Any]:
 
 
 def decode_sleep_temp_event(p: bytes) -> dict[str, Any]:
-    """0x75 — payload [2..15]; auto-extractor only found 64-bit reads (likely
-    stack-frame loads, not wire). Emit raw bytes.
+    """0x75 — `parse_api_sleep_temp_event` @ 0x2bc518. Variable-length:
+    N u16-LE values, each = temperature_centi_degrees (raw / 100.0 → °C).
+    Timestamps assigned at 30-second intervals ending at utc_time_ms (so the
+    last sample is at `t`, the previous at `t-30s`, etc.). Lib requires
+    payload size to be even and in roughly [2..30].
     """
     n = len(p)
-    if n < 2 or n > 15:
-        raise ValueError(f"SleepTempEvent payload size [2..15], got {n}")
-    return {"hex": p.hex(), "len": n}
+    if n == 0 or n & 1:
+        raise ValueError(f"SleepTempEvent payload size must be even and >0, got {n}")
+    n_samples = n // 2
+    temps_c = [(p[i] | (p[i + 1] << 8)) / 100.0 for i in range(0, n, 2)]
+    return {
+        "n_samples": n_samples,
+        "temps_c": temps_c,
+        "sample_interval_s": 30,
+        "_note": "samples are spaced 30s ending at this record's t",
+    }
 
 
 def decode_spo2_dc_event(p: bytes) -> dict[str, Any]:
@@ -655,21 +665,69 @@ def decode_alert_event(p: bytes) -> dict[str, Any]:
 
 
 def decode_tag_event(p: bytes) -> dict[str, Any]:
-    """0x79 — small payload; raw byte dump."""
-    return {"hex": p.hex(), "len": len(p)}
+    """0x79 — variable-length record dispatched by byte 0.
+    Empirical: byte 0 ∈ {0x02, 0x03}; sizes mostly 4 bytes (compact event) or
+    occasionally 14/5 bytes (extended). No matching `parse_api_tag_event`
+    symbol in the lib — this type may actually be alert/atlas-related under
+    a different proto type. We surface byte 0 as `event_kind` and the rest
+    as raw bytes."""
+    if not p:
+        raise ValueError("TagEvent payload empty")
+    return {
+        "event_kind": p[0],
+        "fields_hex": p[1:].hex(),
+        "len": len(p),
+    }
 
 
 def decode_user_info(p: bytes) -> dict[str, Any]:
-    """0x5c — rare; raw byte dump."""
-    return {"hex": p.hex(), "len": len(p)}
+    """0x5c — rare; `parse_user_info_update` @ 0x2ac4a0. Surface raw bytes
+    plus byte 0 as kind."""
+    if not p:
+        raise ValueError("UserInfo payload empty")
+    return {
+        "user_info_kind": p[0],
+        "fields_hex": p[1:].hex(),
+        "len": len(p),
+    }
 
 
 def decode_sleep_period_info_2(p: bytes) -> dict[str, Any]:
-    """0x6a — no `parse_api_sleep_period_info_2` symbol in the lib; the type
-    appears in captures but the parser is either inlined or shared with another
-    handler. Emit raw bytes so consumers see something.
+    """0x6a — `parse_api_sleep_period_info` @ 0x2ad23c (the lib symbol is shared
+    with the Java enum's `_2` suffix). Wire (10 bytes):
+
+      <average_hr:u8>     — bpm * 0.5  (so wire 130 = 65 BPM)
+      <hr_trend:s8>       — signed * 0.0625
+      <mzci:u8>           — * 0.0625
+      <dzci:u8>           — * 0.0625
+      <breath:u8>         — / 8.0  (breaths/min, fixed-point 3-frac-bits)
+      <breath_v:u8>       — / 8.0
+      <motion_count:u8>   — bounded < 121, else throw RepNumericRangeError
+      <sleep_state:s8>    — bounded < 3, else throw  (0/1/2 enum)
+      <cv:u16-LE>         — / 65536.0  → float in [0..1)
+
+    Float multipliers extracted from .rodata @ 0x117840: (0.5, 0.0625, 0.0625, 0.0625).
     """
-    return {"hex": p.hex(), "len": len(p), "_note": "no dedicated parser symbol in lib"}
+    if len(p) < 10:
+        raise ValueError(f"SleepPeriodInfo payload must be >=10 bytes, got {len(p)}")
+    motion_count = p[6]
+    if motion_count >= 0x79:
+        raise ValueError(f"motion_count={motion_count} out of range [0..120]")
+    sleep_state = _i8(p[7])
+    if not (0 <= sleep_state < 3):
+        raise ValueError(f"sleep_state={sleep_state} out of range [0..2]")
+    cv_raw = p[8] | (p[9] << 8)
+    return {
+        "average_hr": p[0] * 0.5,
+        "hr_trend": _i8(p[1]) * 0.0625,
+        "mzci": p[2] * 0.0625,
+        "dzci": p[3] * 0.0625,
+        "breath": p[4] / 8.0,
+        "breath_v": p[5] / 8.0,
+        "motion_count": motion_count,
+        "sleep_state": sleep_state,
+        "cv": cv_raw / 65536.0,
+    }
 
 
 # ----------------------------------------------------------------------------
@@ -1002,6 +1060,239 @@ def _dd_lib_no_parser(p: bytes) -> dict[str, Any]:
 #                      0x00 (header), then a sub-sub-byte (commonly 0x09).
 
 
+# ---- Smaller, lower-volume DD sub-types: minimal decoders that surface the
+# proto type label + the raw bytes. Each lib parser exists; field-level decode
+# left as future work since these are <10 records each in our 70 h capture. ----
+
+def _dd_security_failure(p: bytes) -> dict[str, Any]:
+    """0x61/0x0f — parse_security_failure @ 0x2af828. Multi-case dispatch
+    on byte 1 (failure kind). Bytes 2..4 = u8 sub-fields; bytes 4..6 = u16."""
+    if len(p) < 5:
+        raise ValueError("security_failure payload too short")
+    return {"_dd": "DebugDataSecurityFailure", "kind": p[1], "fields_hex": p[2:].hex()}
+
+
+def _dd_bootloader_debug_log(p: bytes) -> dict[str, Any]:
+    """0x61/0x1b — parse_bootloader_debug_log @ 0x2b13a4. Variable-length;
+    typically ≥7 bytes."""
+    return {"_dd": "DebugDataBootLoaderDebugLog", "fields_hex": p[1:].hex(), "len": len(p)}
+
+
+def _dd_fuel_gauge_register_dump(p: bytes) -> dict[str, Any]:
+    """0x61/0x1e — parse_fuel_gauge_register_dump @ 0x2b1f70. Wire (≥14 bytes):
+    <reg_id_a:u16 LE><body:8 bytes><reg_id_b:u16 LE>."""
+    if len(p) < 14:
+        raise ValueError("fuel_gauge_register_dump payload too short")
+    return {
+        "_dd": "DebugDataFuelGaugeRegisterDump",
+        "reg_id_a": _u16(p, 2),
+        "reg_id_b": _u16(p, 12),
+        "body_hex": p[4:12].hex(),
+    }
+
+
+def _dd_ring_hw_information(p: bytes) -> dict[str, Any]:
+    """0x61/0x1f — parse_ring_hw_information @ 0x2b21a8. Reads u32 at +3."""
+    if len(p) < 9:
+        raise ValueError("ring_hw_information payload too short")
+    return {"_dd": "DebugDataRingHwInformation", "u32_at_3": _u32(p, 3), "fields_hex": p[1:].hex()}
+
+
+def _dd_charging_ended_statistics(p: bytes) -> dict[str, Any]:
+    """0x61/0x20 — parse_charging_ended_statistics @ 0x2b23f0. Reads u32 at +1, u32 at +7."""
+    if len(p) < 12:
+        raise ValueError("charging_ended_statistics payload too short")
+    return {
+        "_dd": "DebugDataChargingEndStatistics",
+        "u32_at_1": _u32(p, 1),
+        "u32_at_7": _u32(p, 7),
+        "fields_hex": p[1:].hex(),
+    }
+
+
+def _dd_fuel_gauge_logging_registers(p: bytes) -> dict[str, Any]:
+    """0x61/0x21 — parse_fuel_gauge_logging_registers @ 0x2b2628. Reads 8 bytes at +1."""
+    if len(p) < 9:
+        raise ValueError("fuel_gauge_logging_registers payload too short")
+    return {"_dd": "DebugDataFuelGaugeLoggingRegisters", "registers_hex": p[1:9].hex()}
+
+
+def _dd_hardware_test_start_values(p: bytes) -> dict[str, Any]:
+    """0x61/0x25 — parse_hardware_test_start_values @ 0x2b2cec. Reads u16 at +2, 8 bytes at +5."""
+    if len(p) < 13:
+        raise ValueError("hardware_test_start_values payload too short")
+    return {
+        "_dd": "DebugDataHardwareTestStartValues",
+        "u16_at_2": _u16(p, 2),
+        "body_hex": p[5:13].hex(),
+    }
+
+
+def _dd_charging_ended_statistics_continued(p: bytes) -> dict[str, Any]:
+    """0x61/0x27 — parse_charging_ended_statistics_continued @ 0x2b359c. Reads
+    8 bytes at +1, u32 at +9."""
+    if len(p) < 13:
+        raise ValueError("charging_ended_statistics_continued payload too short")
+    return {
+        "_dd": "DebugDataChargingEndStatisticsContinued",
+        "body_hex": p[1:9].hex(),
+        "u32_at_9": _u32(p, 9),
+    }
+
+
+def _dd_field_test_information(p: bytes) -> dict[str, Any]:
+    """0x61/0x2a — parse_field_test_information @ 0x2b47ac. Multi-case on byte 1."""
+    if len(p) < 2:
+        raise ValueError("field_test_information payload too short")
+    return {"_dd": "DebugDataFieldTestInformation", "kind": p[1], "fields_hex": p[2:].hex()}
+
+
+def _dd_stack_usage_statistics(p: bytes) -> dict[str, Any]:
+    """0x61/0x2b — parse_stack_usage_statistics @ 0x2b4ac8. Reads 8 bytes at +1, u32 at +9."""
+    if len(p) < 13:
+        raise ValueError("stack_usage_statistics payload too short")
+    return {
+        "_dd": "DebugDataStackUsageStatistics",
+        "stack_high_watermarks_hex": p[1:9].hex(),
+        "u32_at_9": _u32(p, 9),
+    }
+
+
+def _dd_daily_drop_sample(p: bytes) -> dict[str, Any]:
+    """0x61/0x3f — parse_daily_drop_sample @ 0x2bb4a4. Reads 3 u8 fields at +1..+3."""
+    if len(p) < 4:
+        raise ValueError("daily_drop_sample payload too short")
+    return {
+        "_dd": "DebugDataDailyDropSample",
+        "byte_1": p[1],
+        "byte_2": p[2],
+        "byte_3": p[3],
+        "fields_hex": p[4:].hex(),
+    }
+
+
+# ---- Stateful DD sub-types: per-record structured decode + multi-record kind
+# label. Full session-state aggregation (matching `Session+0x138 DebugData_State_v1`)
+# is left as future work; consumers can build it on top using `_dd` + `kind`. ----
+
+
+def _dd_charger_information(p: bytes) -> dict[str, Any]:
+    """0x61/0x36 — `parse_charger_information` @ 0x2b80c0. Stateful: each record
+    contributes one `sub_sub_type` (low 7 bits of byte 1) to a session-level
+    accumulator at `Session+0x138`. The lib emits `ChargerLinkParams` /
+    `ChargerFirmwareAndPsn` / `ChargerSelfTestResult` after the session is
+    flushed. We surface per-record structure:
+
+      <sub:1><kind:u8>           kind bit 7 = `is_session_start`,
+                                  kind bits 0..6 = `sub_sub_type` (0..4):
+        - 0x01: ASCII text       (e.g. firmware/PSN: "60503789")
+        - 0x02: u32 timestamp(?)
+        - 0x03: charger self-test sub-record
+        - 0x04: 2× u32 link params (stored at session +0x164/+0x168)
+      <body>:                    sub-sub-type-specific bytes
+    """
+    if len(p) < 2:
+        raise ValueError("charger_information payload too short")
+    kind = p[1]
+    sst = kind & 0x7F
+    is_start = bool(kind >> 7)
+    out: dict[str, Any] = {
+        "_dd": "DebugDataChargerInformation",
+        "is_session_start": is_start,
+        "sub_sub_type": sst,
+    }
+    body = p[2:]
+    if sst == 0x01 and body:
+        try:
+            out["text"] = body.decode("ascii", errors="replace")
+        except Exception:
+            out["body_hex"] = body.hex()
+    elif sst == 0x04 and len(body) >= 8:
+        out["link_param_a"] = _u32(body, 0)
+        out["link_param_b"] = _u32(body, 4)
+        if len(body) > 8:
+            out["body_tail_hex"] = body[8:].hex()
+    else:
+        out["body_hex"] = body.hex()
+    return out
+
+
+def _dd_charger_debug_information(p: bytes) -> dict[str, Any]:
+    """0x61/0x3d — `parse_charger_debug_information` @ 0x2b9f24. Stateful:
+    `record_kind == 0` is a header announcing what's coming; `record_kind == 1`
+    is a continuation data part. Helpers:
+      `process_charger_debug_header` @ 0x2b9878
+      `process_charger_debug_data_part` @ 0x2b9af4
+      `is_charger_debug_info_ready` @ 0x2b9588
+      `emit_charger_debug_info` @ 0x2b95d8 — fires when all parts are received.
+
+    Per-record fields:
+      - record_kind = "header" (0) | "continuation" (1)
+      - For headers: `meta_hex` (≥7 bytes encoding sub-type + length + flags)
+      - For continuations: `data_hex` (variable-length payload bytes)
+    """
+    if len(p) < 2:
+        raise ValueError("charger_debug_information payload too short")
+    kind = p[1]
+    out: dict[str, Any] = {"_dd": "DebugDataChargerDebugInformation", "kind_byte": kind}
+    body = p[2:]
+    if kind == 0:
+        out["record_kind"] = "header"
+        out["meta_hex"] = body.hex()
+    elif kind == 1:
+        out["record_kind"] = "continuation"
+        out["data_hex"] = body.hex()
+    else:
+        out["record_kind"] = f"unknown_{kind}"
+        out["body_hex"] = body.hex()
+    return out
+
+
+def _dd_hardware_test_result_values(p: bytes) -> dict[str, Any]:
+    """0x61/0x26 — `parse_hardware_test_result_values` @ 0x2b2f24. Stateful:
+    records arrive in triples (phase 0 = init, 1 = mid, 2 = final). Each phase
+    populates different offsets in the session state at +0x138. Per-record
+    fields by phase:
+      - phase 0 (init):  bytes 2..6 = small u8 fields, bytes 6..10 = i32, bytes 10..12 = u16
+      - phase 1 (mid):   bytes 2..4 = u16, bytes 4..6 = u16  (stored at session +0x1c2/+0x1c4)
+      - phase 2 (final): bytes 2..6 = i32, bytes 6..10 = u32 (more storage)
+    """
+    if len(p) < 2:
+        raise ValueError("hardware_test_result_values payload too short")
+    phase = p[1]
+    out: dict[str, Any] = {"_dd": "DebugDataHardwareTestResultValues", "phase_byte": phase}
+    body = p[2:]
+    if phase == 0:
+        out["phase"] = "init"
+        if len(body) >= 12:
+            out["init_byte_2"] = body[0]
+            out["init_byte_3"] = body[1]
+            out["init_i32_at_4"] = _i32(body, 2)
+            out["init_i32_at_8"] = _i32(body, 6) if len(body) >= 10 else None
+            if len(body) > 10:
+                out["init_tail_hex"] = body[10:].hex()
+        else:
+            out["body_hex"] = body.hex()
+    elif phase == 1:
+        out["phase"] = "mid"
+        if len(body) >= 4:
+            out["mid_u16_a"] = _u16(body, 0)
+            out["mid_u16_b"] = _u16(body, 2)
+        else:
+            out["body_hex"] = body.hex()
+    elif phase == 2:
+        out["phase"] = "final"
+        if len(body) >= 8:
+            out["final_i32_at_2"] = _i32(body, 0)
+            out["final_u32_at_6"] = _u32(body, 4)
+        else:
+            out["body_hex"] = body.hex()
+    else:
+        out["phase"] = f"unknown_{phase}"
+        out["body_hex"] = body.hex()
+    return out
+
+
 def _dd_alt_text(p: bytes) -> dict[str, Any]:
     """0x61/0x04 — ASCII debug strings routed through DD instead of 0x43."""
     return {
@@ -1084,18 +1375,32 @@ _DD_SUB_DECODERS: dict[int, Callable[[bytes], dict[str, Any]]] = {
     0x0a: _dd_flash_usage_statistics,
     0x0c: _dd_period_info_statistics,
     0x0d: _dd_ble_usage_statistics,
+    0x0f: _dd_security_failure,
     0x14: _dd_fuel_gauge_statistics,
     0x15: _dd_finger_detection,
     0x1a: _dd_event_sync_statistics,
+    0x1b: _dd_bootloader_debug_log,
+    0x1e: _dd_fuel_gauge_register_dump,
+    0x1f: _dd_ring_hw_information,
+    0x20: _dd_charging_ended_statistics,
+    0x21: _dd_fuel_gauge_logging_registers,
     0x23: _dd_event_sync_cache_statistics,
     0x24: _dd_battery_level_changed,
+    0x25: _dd_hardware_test_start_values,
+    0x26: _dd_hardware_test_result_values,    # stateful (Session)
+    0x27: _dd_charging_ended_statistics_continued,
     0x28: _dd_afe_statistics_values,
     0x29: _dd_acm_configuration_changed,
+    0x2a: _dd_field_test_information,
+    0x2b: _dd_stack_usage_statistics,
     0x30: _dd_alt_periodic_counter,           # lib-no-parser-but-structured
     0x33: _dd_open_afe_ppg_settings_data,
     0x35: _dd_ppg_signal_quality_stats,
+    0x36: _dd_charger_information,            # stateful (Session)
     0x3b: _dd_alt_afe_period_tick,            # lib-no-parser-but-structured
     0x3c: _dd_alt_ppg_cont,                   # lib-no-parser-but-structured
+    0x3d: _dd_charger_debug_information,      # stateful (Session)
+    0x3f: _dd_daily_drop_sample,
 }
 # Sub-bytes that map to the lib's default-throw branch AND we have not
 # observed enough of to reverse-engineer (or which appear not in our captures):

@@ -34,6 +34,7 @@ from typing import Any
 from .crypto import compute_handshake_proof, extract_auth_key_from_realm
 from .decoders import CvaPpgDecoder, canonical_type, decode
 from .envelope import Record
+from .persistence import CursorStore
 from .framing import (
     OPCODES,
     OuterFrame,
@@ -84,6 +85,8 @@ class OuraRingClient:
         realm_path: str | os.PathLike | None = None,
         event_categories: tuple[int, ...] = (0x01, 0x03, 0x05, 0x07, 0x09, 0x0b, 0x0d),
         reconnect: bool = True,
+        cursor_store: "CursorStore | None" = None,
+        cursor_save_every: int = 64,
     ):
         if (auth_key is None) == (realm_path is None):
             raise ValueError("Pass exactly one of auth_key= or realm_path=")
@@ -95,6 +98,14 @@ class OuraRingClient:
         self.auth_key: bytes = auth_key
         self.event_categories = event_categories
         self.reconnect = reconnect
+        # Cursor persistence: holds the per-sub-op delta-sync positions across
+        # process restarts. The ONLY field of ClientState whose loss matters
+        # for correctness — see oura_ring.persistence for rationale.
+        self.cursor_store = cursor_store
+        if cursor_store is not None:
+            cursor_store.load()
+        self._cursor_save_every = max(1, cursor_save_every)
+        self._cursor_updates_since_save = 0
         self._client = None       # bleak.BleakClient
         self._notify_q: asyncio.Queue[tuple[float, bytes]] = asyncio.Queue()
 
@@ -112,12 +123,26 @@ class OuraRingClient:
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
+        # Always flush cursors on shutdown — losing the last few minutes of
+        # cursor advances means the next session re-fetches that window.
+        self._save_cursors_safe()
         if self._client is not None:
             try:
                 await self._client.disconnect()
             except Exception:
                 pass
             self._client = None
+
+    def _save_cursors_safe(self) -> None:
+        """Save the cursor store to disk, swallowing any error (a failed save
+        should never crash the streamer — worst case is we re-sync next time)."""
+        if self.cursor_store is None:
+            return
+        try:
+            self.cursor_store.save()
+            self._cursor_updates_since_save = 0
+        except Exception as e:
+            log.warning("cursor_store save failed: %s", e)
 
     # ----- connection lifecycle -----
 
@@ -306,16 +331,23 @@ class OuraRingClient:
         records it has buffered since the last delta-sync cursor we acknowledged.
 
         We start with two probes that the app emits on every reconnect:
-            10 09 00 <0:3 LE> 00 ff ff ff ff ff   — sub-op 0x00 cursor=0
-            10 09 ff <0:3 LE> 00 ff ff ff ff ff   — sub-op 0xff cursor=0
+            10 09 00 <cursor:3 LE> 00 ff ff ff ff ff   — sub-op 0x00
+            10 09 ff <cursor:3 LE> 00 ff ff ff ff ff   — sub-op 0xff
         Sub-op 0x00 is the legacy "general" cursor; 0xff is the "all types"
-        cursor used after the first connection. Cursor=0 = full re-sync.
+        cursor used after the first connection.
 
-        For finer-grained catch-up after the initial handshake, the driver can
-        invoke `request_history(sub_op, cursor)` directly with a saved cursor.
+        If a `cursor_store` was configured, we use the saved per-sub-op
+        cursors here so we get a true delta-sync instead of pulling everything
+        back. Falls back to `cursor=0` (full re-sync) for any sub-op we've
+        never seen before.
         """
-        await self.request_history(sub_op=0x00, cursor=0)
-        await self.request_history(sub_op=0xff, cursor=0)
+        c00 = self.cursor_store.get(0x00) if self.cursor_store else 0
+        cff = self.cursor_store.get(0xff) if self.cursor_store else 0
+        await self.request_history(sub_op=0x00, cursor=c00)
+        await self.request_history(sub_op=0xff, cursor=cff)
+        if self.cursor_store and (c00 or cff):
+            log.info("delta-sync resumed: sub_op 0x00 cursor=%d, 0xff cursor=%d",
+                     c00, cff)
 
     # ----- stream -----
 
@@ -339,6 +371,17 @@ class OuraRingClient:
                             for rec in _outer_to_records(f, utc_ms):
                                 if rec.type == "_RING_RESET_ACK":
                                     cva_ppg_dec.reset()
+                                # Capture delta-sync cursor positions as the
+                                # ring reports them, persist periodically.
+                                if (rec.type == "_HISTORY_FETCH_RESP"
+                                        and self.cursor_store is not None):
+                                    sub_op = rec.data.get("sub_op")
+                                    cur = rec.data.get("cursor")
+                                    if (sub_op is not None and cur is not None
+                                            and self.cursor_store.update(sub_op, cur)):
+                                        self._cursor_updates_since_save += 1
+                                        if self._cursor_updates_since_save >= self._cursor_save_every:
+                                            self._save_cursors_safe()
                                 yield rec
                     else:
                         for r in parse_inner_records(value):
@@ -365,8 +408,13 @@ class OuraRingClient:
                                 data=data,
                             )
             except (asyncio.CancelledError, KeyboardInterrupt):
+                # Best-effort cursor flush on cancel — don't lose the work.
+                self._save_cursors_safe()
                 raise
             except Exception as e:
+                # Disconnect path: flush cursors before reconnect attempt so
+                # an immediate crash still preserves the latest positions.
+                self._save_cursors_safe()
                 yield Record(
                     t=int(time.time() * 1000), rt=None, ctr=None, sess=None,
                     tag="_DISCONNECT", type="_DISCONNECT",

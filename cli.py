@@ -31,6 +31,14 @@ def main(argv: list[str] | None = None) -> int:
     src.add_argument("--realm", help="Path to assa-store.realm to extract auth_key from")
     lv.add_argument("--no-reconnect", action="store_true",
                     help="Stop on first disconnect instead of auto-reconnecting")
+    lv.add_argument("--cursor-file",
+                    help="Path to a JSON file storing the per-sub-op delta-sync "
+                         "cursors. With this set, the next reconnect resumes "
+                         "from the saved position instead of full re-sync. "
+                         "Default: ~/.local/share/oura_ring/cursors.json. "
+                         "Use --no-cursor-file to disable persistence.")
+    lv.add_argument("--no-cursor-file", action="store_true",
+                    help="Disable cursor persistence; every reconnect does a full re-sync.")
 
     args = ap.parse_args(argv)
     if args.cmd == "replay":
@@ -42,15 +50,21 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _run_live(args) -> int:
+    from .persistence import CursorStore
     from .transport import OuraRingClient
 
     auth_key = bytes.fromhex(args.auth_key) if args.auth_key else None
     realm_path = args.realm
 
+    cursor_store: CursorStore | None = None
+    if not args.no_cursor_file:
+        cursor_store = CursorStore(args.cursor_file) if args.cursor_file else CursorStore()
+
     async def _go():
         async with OuraRingClient(
             mac=args.mac, auth_key=auth_key, realm_path=realm_path,
             reconnect=not args.no_reconnect,
+            cursor_store=cursor_store,
         ) as client:
             async for rec in client.stream():
                 sys.stdout.write(rec.to_json())
