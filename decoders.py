@@ -673,6 +673,457 @@ def decode_sleep_period_info_2(p: bytes) -> dict[str, Any]:
 
 
 # ----------------------------------------------------------------------------
+# 0x61 API_DEBUG_DATA — sub-byte dispatched, 46 sub-types per RTTI in the lib
+#
+# parse_api_debug_data at libringeventparser.so 0x2ae0a0 reads the first byte of
+# the payload (offset 0), subtracts 2, jump-table dispatches to one of ~46
+# parsers. Sub-byte mapping was extracted from the table at .rodata 0x121937.
+#
+# Sub-type wire formats are derived from the per-parser disassembly. Many share
+# a common shape: per-event statistics where `timestamp` is the EVENT'S
+# `utc_time_ms` (already in `Record.t`), and the payload carries the stats.
+# ----------------------------------------------------------------------------
+
+
+def _dd_sleep_statistics(p: bytes) -> dict[str, Any]:
+    """0x61/0x09 DebugDataSleepStatistics — parse_sleep_statistics @ 0x2aed30.
+    Wire (14 bytes): <sub:1><ticks_in_deep_sleep:u32 LE><ticks_in_sleep:u32 LE>
+                     <ticks_awake:u32 LE><pfsm_state:u8>
+    `timestamp` proto field comes from event.utc_time_ms (Record.t)."""
+    if len(p) < 14:
+        raise ValueError(f"sleep_statistics payload must be >=14 bytes, got {len(p)}")
+    return {
+        "_dd": "DebugDataSleepStatistics",
+        "ticks_in_deep_sleep": _u32(p, 1),
+        "ticks_in_sleep": _u32(p, 5),
+        "ticks_awake": _u32(p, 9),
+        "pfsm_state": p[13],
+    }
+
+
+def _dd_flash_usage_statistics(p: bytes) -> dict[str, Any]:
+    """0x61/0x0a DebugDataFlashUsageStatistics — parse_flash_usage_statistics @ 0x2aef60.
+    Wire (13 bytes): <sub:1><ticks_reading:u32><ticks_writing:u32><ticks_erasing:u32>"""
+    if len(p) < 13:
+        raise ValueError(f"flash_usage payload must be >=13 bytes, got {len(p)}")
+    return {
+        "_dd": "DebugDataFlashUsageStatistics",
+        "ticks_reading_flash": _u32(p, 1),
+        "ticks_writing_flash": _u32(p, 5),
+        "ticks_erasing_flash": _u32(p, 9),
+    }
+
+
+def _dd_period_info_statistics(p: bytes) -> dict[str, Any]:
+    """0x61/0x0c DebugDataPeriodInfoStatistics — parse_period_info_statistics @ 0x2af190.
+    Wire (10 bytes): <sub:1><ticks_measuring_last_period:u32>
+                     <systime_spent_in_last_state_raw:u32><pfsm_state:u8>
+    `systime_spent_in_last_state_s` (float) = raw_u32 / 10.0."""
+    if len(p) < 10:
+        raise ValueError(f"period_info payload must be >=10 bytes, got {len(p)}")
+    return {
+        "_dd": "DebugDataPeriodInfoStatistics",
+        "ticks_measuring_last_period": _u32(p, 1),
+        "systime_spent_in_last_state_s": _u32(p, 5) / 10.0,
+        "pfsm_state": p[9],
+    }
+
+
+def _dd_ble_usage_statistics(p: bytes) -> dict[str, Any]:
+    """0x61/0x0d DebugDataBleUsageStatistics — parse_ble_usage_statistics @ 0x2afea0.
+    Wire (13 bytes): <sub:1><ticks_fast:u32><ticks_slow:u32><ticks_advertising:u32>"""
+    if len(p) < 13:
+        raise ValueError(f"ble_usage payload must be >=13 bytes, got {len(p)}")
+    return {
+        "_dd": "DebugDataBleUsageStatistics",
+        "ticks_fast_mode": _u32(p, 1),
+        "ticks_slow_mode": _u32(p, 5),
+        "ticks_advertising_mode": _u32(p, 9),
+    }
+
+
+def _dd_fuel_gauge_statistics(p: bytes) -> dict[str, Any]:
+    """0x61/0x14 DebugDataFuelGaugeStatistics — parse_fuel_gauge_statistics @ 0x2b0684.
+    Wire (14 bytes):
+      <sub:1>
+      <battery_pct_raw:u16>             (fixed-point: raw / 256.0 → percent)
+      <average_battery_voltage_mv:u16>
+      <average_current_consumption:i32> (signed)
+      <remaining_capacity:u16>
+      <coulomb_high:s8><coulomb_mid:u8><coulomb_low:u8>  (signed 24-bit)
+    """
+    if len(p) < 14:
+        raise ValueError(f"fuel_gauge payload must be >=14 bytes, got {len(p)}")
+    cc = (_i8(p[11]) << 16) | (p[12] << 8) | p[13]
+    return {
+        "_dd": "DebugDataFuelGaugeStatistics",
+        "battery_percentage": _u16(p, 1) / 256.0,
+        "average_battery_voltage_mv": _u16(p, 3),
+        "average_current_consumption": _i32(p, 5),
+        "remaining_capacity": _u16(p, 9),
+        "coulomb_counter": cc,
+    }
+
+
+def _dd_event_sync_statistics(p: bytes) -> dict[str, Any]:
+    """0x61/0x1a DebugDataEventSyncStatistics — parse_event_sync_statistics @ 0x2b1174.
+    Wire (12 bytes): <sub:1><connection_interval:u16>
+                     <synced_bytes_count:u32><sync_duration_ms:u32><mtu:u8>"""
+    if len(p) < 12:
+        raise ValueError(f"event_sync payload must be >=12 bytes, got {len(p)}")
+    return {
+        "_dd": "DebugDataEventSyncStatistics",
+        "connection_interval": _u16(p, 1),
+        "synced_bytes_count": _u32(p, 3),
+        "sync_duration_in_ms": _u32(p, 7),
+        "mtu": p[11],
+    }
+
+
+def _dd_event_sync_cache_statistics(p: bytes) -> dict[str, Any]:
+    """0x61/0x23 DebugDataEventSyncCacheStatistics — parse_event_sync_cache_statistics @ 0x2b2a9c.
+    Wire (13 bytes): each of 4 fields = u16-LE | (u8 << 16) → effective u24 LE.
+    Layout: <sub:1>
+            <hdr_cache_lo:u16><hdr_cache_hi:u8>
+            <hdr_flash_lo:u16><hdr_flash_hi:u8>
+            <evt_cache_lo:u16><evt_cache_hi:u8>
+            <evt_flash_lo:u16><evt_flash_hi:u8>"""
+    if len(p) < 13:
+        raise ValueError(f"event_sync_cache payload must be >=13 bytes, got {len(p)}")
+    def u24(lo_off: int, hi_off: int) -> int:
+        return _u16(p, lo_off) | (p[hi_off] << 16)
+    return {
+        "_dd": "DebugDataEventSyncCacheStatistics",
+        "header_read_count_from_cache": u24(1, 3),
+        "header_read_count_from_flash": u24(4, 6),
+        "event_read_count_from_cache": u24(7, 9),
+        "event_read_count_from_flash": u24(10, 12),
+    }
+
+
+def _dd_acm_configuration_changed(p: bytes) -> dict[str, Any]:
+    """0x61/0x29 DebugDataAcmConfigurationChanged — parse_acm_configuration_change @ 0x2b4304.
+    Wire (8 bytes): <sub:1><mode:u8><acc_odr:u8><acc_range:u8>
+                    <gyro_odr:u8><gyro_range:u8><event_mask_and_fifo:u16>
+    The trailing u16 holds the accelerator-enabled-event-mask and the requested
+    FIFO sample depth (proto field 8); the lib stores it as a single u16 so we
+    surface the raw value."""
+    if len(p) < 8:
+        raise ValueError(f"acm_config payload must be >=8 bytes, got {len(p)}")
+    return {
+        "_dd": "DebugDataAcmConfigurationChanged",
+        "accelerometer_mode": p[1],
+        "accelerometer_odr": p[2],
+        "accelerometer_range": p[3],
+        "gyroscope_odr": p[4],
+        "gyroscope_range": p[5],
+        "event_mask_and_fifo_u16": _u16(p, 6),
+    }
+
+
+class _BitStream:
+    """LSB-first within each byte, MSB-first across the stream.
+    Mirrors `parse_dd_ppg_sq_stat` at libringeventparser.so 0x2b6ec0.
+    Reading N bits at (byte_off, bit_off) consumes them across byte boundaries
+    and accumulates with left-shift, so bits read first end up in the high
+    positions of the returned int."""
+
+    __slots__ = ("buf", "byte_off", "bit_off")
+
+    def __init__(self, buf: bytes, start_off: int = 0) -> None:
+        self.buf = buf
+        self.byte_off = start_off
+        self.bit_off = 0
+
+    def read(self, nbits: int) -> int:
+        if not (0 <= nbits <= 32):
+            raise ValueError(f"nbits {nbits} out of range")
+        out = 0
+        bits_consumed = 0
+        while bits_consumed < nbits:
+            if self.byte_off >= len(self.buf):
+                raise ValueError("bit-stream underflow")
+            byte = self.buf[self.byte_off]
+            bits_avail = 8 - self.bit_off
+            take = min(nbits - bits_consumed, bits_avail)
+            mask = (1 << take) - 1
+            val = (byte >> self.bit_off) & mask
+            out = (out << take) | val
+            self.bit_off += take
+            if self.bit_off == 8:
+                self.bit_off = 0
+                self.byte_off += 1
+            bits_consumed += take
+        return out
+
+
+def _dd_ppg_signal_quality_stats(p: bytes) -> dict[str, Any]:
+    """0x61/0x35 DebugDataPpgSignalQualityStats — parse_ppg_signal_quality_stats @ 0x2b714c.
+
+    Wire layout:
+      <sub:1>
+      <byte_1:u8>           high nibble = ppg_measurement_slot_1, low nibble = slot_2
+      <byte_2:s8>           low 7 bits = tune_reason; sign bit must be 0 (else throw)
+      <byte_3:u8>           led_channel_description_1 (per-record, often 30 = 0x1e)
+      <byte_4:s8>           low 6 bits = content_mask flags 0..5; sign bit must be 0
+      <bit-packed payload:* N bits per set flag, MSB-first across byte boundaries>
+
+    Per-flag bit-widths (from dispatch at 0x2b71e8 onwards):
+      flag 0 = 9 bits   → snr_value (left-shifted 11 in lib's accumulator combine)
+      flag 1 = 4 + 8 b  → ac_amplitude (mantissa<<exponent encoding)
+      flag 2 = 15 bits  → dc_value
+      flag 3 = 9 bits   → coupling_index
+      flag 4 = 4 bits   → tune_reason_extended
+      flag 5 = 7 bits   → ibi_quality_percentage  (most common — ~all observed records)
+      flag 6            → stateful (uses session); not decoded here
+    """
+    if len(p) < 5:
+        raise ValueError(f"ppg_signal_quality_stats payload must be >=5 bytes, got {len(p)}")
+    b1 = p[1]
+    b2 = p[2]
+    b3 = p[3]
+    b4 = p[4]
+    if b2 & 0x80 or b4 & 0x80:
+        raise ValueError("ppg_signal_quality_stats validity bit set")
+    content_mask = b4 & 0x3F
+    out: dict[str, Any] = {
+        "_dd": "DebugDataPpgSignalQualityStats",
+        "ppg_measurement_slot_1": b1 >> 4,
+        "ppg_measurement_slot_2": b1 & 0x0F,
+        "tune_reason": b2 & 0x7F,
+        "led_channel_description_1": b3,
+        "content_mask": content_mask,
+    }
+    if b4 & 0x40:
+        out["stateful_flag_set"] = True
+        out["bit_payload_hex"] = p[5:].hex()
+        return out
+    if len(p) > 5:
+        bs = _BitStream(p, start_off=5)
+        try:
+            if content_mask & 0x01:
+                out["snr_value"] = bs.read(9)
+            if content_mask & 0x02:
+                shift = bs.read(4)
+                val = bs.read(8)
+                out["ac_amplitude"] = val << shift
+            if content_mask & 0x04:
+                out["dc_value"] = bs.read(15)
+            if content_mask & 0x08:
+                out["coupling_index"] = bs.read(9)
+            if content_mask & 0x10:
+                out["tune_reason_extended"] = bs.read(4)
+            if content_mask & 0x20:
+                out["ibi_quality_percentage"] = bs.read(7)
+        except ValueError:
+            out["bit_payload_truncated"] = True
+            out["bit_payload_hex"] = p[5:].hex()
+    return out
+
+
+def _dd_afe_statistics_values(p: bytes) -> dict[str, Any]:
+    """0x61/0x28 DebugDataAfeStatisticsValues — parse_afe_statistics_values @ 0x2b37cc.
+
+    Stateful: byte 1 distinguishes record kind (1 = session-header, 0 = continuation).
+    The lib accumulates per-LED measurement counts across multiple records into a
+    `DebugData_State_v1` at session()+0x138 and emits a single ParsedEvent at
+    session-end. We surface the per-record kind + raw stats; full structured
+    aggregation would mirror CvaPpgDecoder (left as future work). In the test
+    capture all 2,710 records carry zero-stats, so this minimal decode loses
+    nothing measurable — it correctly identifies the session structure."""
+    if len(p) < 14:
+        raise ValueError(f"afe_statistics_values payload must be >=14 bytes, got {len(p)}")
+    kind_byte = p[1]
+    return {
+        "_dd": "DebugDataAfeStatisticsValues",
+        "record_kind": "header" if kind_byte == 1 else ("continuation" if kind_byte == 0 else f"unknown_{kind_byte}"),
+        "kind_byte": kind_byte,
+        "stats_hex": p[2:].hex(),
+        "all_stats_zero": all(b == 0 for b in p[2:]),
+    }
+
+
+def _dd_finger_detection(p: bytes) -> dict[str, Any]:
+    """0x61/0x15 DebugDataFingerDetection — parse_finger_detection @ 0x2b08f0.
+    Wire (9 bytes): <sub:1><detection_data:u64 LE> — single u64 carrying detection
+    state bits (proto field semantics not exposed; surface the raw u64)."""
+    if len(p) < 9:
+        raise ValueError(f"finger_detection payload must be >=9 bytes, got {len(p)}")
+    return {
+        "_dd": "DebugDataFingerDetection",
+        "detection_u64": int.from_bytes(p[1:9], "little"),
+    }
+
+
+def _dd_battery_level_changed(p: bytes) -> dict[str, Any]:
+    """0x61/0x24 DebugDataBatteryLevelChanged — parse_battery_level_changed @ 0x2ae568.
+    Wire (≥5 bytes): <sub:1><battery_percentage:u8><battery_voltage_mv:u16 LE><reason:u8>
+
+    Empirical (sunday_evening.log): pct ∈ [49..100], mv ∈ [3534..4141] —
+    matches FuelGaugeStatistics independently. The percentage byte is the
+    integer percent directly (0..100), NOT the fixed-point /256 form used
+    by FuelGaugeStatistics.battery_percentage."""
+    if len(p) < 5:
+        raise ValueError(f"battery_level_changed payload must be >=5 bytes, got {len(p)}")
+    return {
+        "_dd": "DebugDataBatteryLevelChanged",
+        "battery_percentage": p[1],
+        "battery_voltage_mv": _u16(p, 2),
+        "reason": p[4],
+    }
+
+
+def _dd_lib_no_parser(p: bytes) -> dict[str, Any]:
+    """Sub-bytes that map to the default-throw entry of the lib's dispatch
+    table — the lib emits RepParseError for these. We surface them with an
+    explicit `_dd` label so they're not confused with sub-bytes whose parser
+    we just haven't written."""
+    return {
+        "_dd": "lib_no_parser",
+        "sub_byte": p[0],
+        "hex": p[1:].hex(),
+        "len": len(p),
+    }
+
+
+# The lib's `parse_api_debug_data` dispatch table maps these 4 sub-bytes to its
+# default-throw branch (RepParseError). BUT empirical inspection of the wire
+# bytes shows they're NOT random garbage — each carries structure that the app
+# clearly consumes downstream (debug-string buffers, periodic state reports).
+# We decode them empirically:
+#
+#   0x04 (77 obs):    ASCII text debug strings (EHRts/chg_rp/DF-…); same
+#                      family as 0x43 DEBUG_EVENT_IND, just routed through 0x61.
+#   0x30 (111 obs):   1-byte counter (0x07/0x08) followed by 11 constant
+#                      bytes — looks like a periodic counter/heartbeat.
+#   0x3b (1,323 obs): u16 LE at offset 2 alternates between 40000 / 20000
+#                      (exactly balanced 662/661) — AFE sample-rate ticks.
+#   0x3c (69 obs):    Variable-length record; first 3 bytes always 0xff 0x01
+#                      0x00 (header), then a sub-sub-byte (commonly 0x09).
+
+
+def _dd_alt_text(p: bytes) -> dict[str, Any]:
+    """0x61/0x04 — ASCII debug strings routed through DD instead of 0x43."""
+    return {
+        "_dd": "DebugDataText",
+        "text": p[1:].decode("ascii", errors="replace"),
+    }
+
+
+def _dd_alt_periodic_counter(p: bytes) -> dict[str, Any]:
+    """0x61/0x30 — 1-byte counter + constant payload."""
+    if len(p) < 2:
+        raise ValueError(f"alt_periodic payload must be >=2 bytes, got {len(p)}")
+    return {
+        "_dd": "DebugDataPeriodicCounter",
+        "counter_byte": p[1],
+        "trailing_hex": p[2:].hex(),
+    }
+
+
+def _dd_alt_afe_period_tick(p: bytes) -> dict[str, Any]:
+    """0x61/0x3b — AFE sample-period tick. Layout (7 bytes):
+       <sub:1><pad:2><period_us:u16 LE><pad:2>
+    Empirical: alternates between 40000 us (25 Hz) and 20000 us (50 Hz)."""
+    if len(p) < 7:
+        raise ValueError(f"afe_period_tick payload must be >=7 bytes, got {len(p)}")
+    return {
+        "_dd": "DebugDataAfePeriodTick",
+        "period_us": _u16(p, 3),
+    }
+
+
+def _dd_alt_ppg_cont(p: bytes) -> dict[str, Any]:
+    """0x61/0x3c — Variable-length record, fixed 3-byte header `ff 01 00`,
+    then 1 sub-sub-byte and a tail. Empirical: 91% of records have sub-sub
+    `0x09` (9 unaccounted bytes follow). Co-occurs with `PPG_cont;NN` debug
+    strings, suggesting a PPG continuation/control record."""
+    if len(p) < 5:
+        raise ValueError(f"alt_ppg_cont payload must be >=5 bytes, got {len(p)}")
+    return {
+        "_dd": "DebugDataPpgCont",
+        "header_3b_hex": p[1:4].hex(),
+        "sub_sub_byte": p[4],
+        "tail_hex": p[5:].hex(),
+    }
+
+
+def _dd_open_afe_ppg_settings_data(p: bytes) -> dict[str, Any]:
+    """0x61/0x33 DebugDataOpenAfePpgSettingsData — parse_open_afe_ppg_settings_data @ 0x2b5cb4.
+    The full settings record (14 bytes) is chip-variant specific (MAX86171/3/8) with
+    vendor PD/LED/ADC/DAC parameters; without per-vendor decoders we surface:
+      - chip_variant byte at offset 1 (0x01=MAX86171, 0x02=MAX86173, 0x03=MAX86178)
+      - settings_hex (remaining bytes)
+    Note: the lib REQUIRES len > 12; shorter records (8B) are RepParseError'd
+    and surface here as `chip_variant_only`."""
+    if len(p) < 2:
+        raise ValueError(f"open_afe_ppg_settings payload must be >=2 bytes, got {len(p)}")
+    chip = p[1]
+    chip_name = {0x01: "MAX86171", 0x02: "MAX86173", 0x03: "MAX86178"}.get(chip, f"unknown_0x{chip:02x}")
+    out = {
+        "_dd": "DebugDataOpenAfePpgSettingsData",
+        "chip_variant": chip,
+        "chip_variant_name": chip_name,
+    }
+    if len(p) >= 14:
+        out["settings_hex"] = p[2:].hex()
+    else:
+        out["truncated"] = True
+        out["payload_hex"] = p[2:].hex()
+    return out
+
+
+# Sub-byte → decoder dispatch (extracted from .rodata jump table at 0x121937).
+# Sub-bytes whose lib table-entry is the default-throw (e.g. 0x03..0x08, 0x0b,
+# 0x13, 0x16, 0x2f, 0x30, 0x39, 0x3b, 0x3c) get the `lib_no_parser` decoder so
+# consumers can distinguish "lib emits RepParseError" from "we haven't written
+# the decoder yet". The active table covers ~96% of all 0x61 records.
+_DD_SUB_DECODERS: dict[int, Callable[[bytes], dict[str, Any]]] = {
+    0x04: _dd_alt_text,                       # ASCII (lib throws but app uses)
+    0x09: _dd_sleep_statistics,
+    0x0a: _dd_flash_usage_statistics,
+    0x0c: _dd_period_info_statistics,
+    0x0d: _dd_ble_usage_statistics,
+    0x14: _dd_fuel_gauge_statistics,
+    0x15: _dd_finger_detection,
+    0x1a: _dd_event_sync_statistics,
+    0x23: _dd_event_sync_cache_statistics,
+    0x24: _dd_battery_level_changed,
+    0x28: _dd_afe_statistics_values,
+    0x29: _dd_acm_configuration_changed,
+    0x30: _dd_alt_periodic_counter,           # lib-no-parser-but-structured
+    0x33: _dd_open_afe_ppg_settings_data,
+    0x35: _dd_ppg_signal_quality_stats,
+    0x3b: _dd_alt_afe_period_tick,            # lib-no-parser-but-structured
+    0x3c: _dd_alt_ppg_cont,                   # lib-no-parser-but-structured
+}
+# Sub-bytes that map to the lib's default-throw branch AND we have not
+# observed enough of to reverse-engineer (or which appear not in our captures):
+_DD_LIB_NO_PARSER: set[int] = {0x03, 0x05, 0x06, 0x07, 0x08, 0x0b, 0x13,
+                                0x16, 0x2f, 0x39}
+
+
+def decode_debug_data(p: bytes) -> dict[str, Any]:
+    """0x61 API_DEBUG_DATA — first byte selects sub-type per RTTI dispatch."""
+    if not p:
+        raise ValueError("DebugData payload is empty")
+    sub = p[0]
+    fn = _DD_SUB_DECODERS.get(sub)
+    if fn is None:
+        if sub in _DD_LIB_NO_PARSER:
+            return _dd_lib_no_parser(p)
+        return {
+            "_dd": f"unknown_sub_0x{sub:02x}",
+            "sub_byte": sub,
+            "hex": p.hex(),
+            "len": len(p),
+        }
+    out = fn(p)
+    out["sub_byte"] = sub
+    return out
+
+
+# ----------------------------------------------------------------------------
 # Fallback for stateful or unmapped types
 # ----------------------------------------------------------------------------
 
@@ -691,6 +1142,7 @@ DECODERS: dict[int, Callable[[bytes], dict[str, Any]]] = {
     0x42: decode_time_sync_ind,
     0x43: decode_debug_event_ind,
     0x45: decode_state_change_ind,
+    0x61: decode_debug_data,
     0x46: decode_temp_event,
     0x47: decode_motion_event,
     0x4a: decode_ppg_amplitude_ind,
